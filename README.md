@@ -1,7 +1,9 @@
 # PDBI_G2
+###:
 Somos alumnos del 6to ciclo del curso de Proyectos de Biodiseño, nos dedicamos a investigar y diseñar dispositivos biomédicos, empleando herramientas de ingeniería biomédica para dar solución a problemáticas de salud en el Perú.
+###Objetivo:
 
-Integrantes:
+###Integrantes:
 | Nombres | Rol | Correo |
 | :--- | :---: | ---: |
 | Jared Matias Neciosup Villarreal | Líder de Modelado y Diseño Mecánico | jared.neciosup@upch.pe |
