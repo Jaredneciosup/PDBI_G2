@@ -4,8 +4,8 @@ Somos alumnos del 6to ciclo del curso de Proyectos de Biodiseño
 Integrantes:
 | Nombres | Rol | Correo |
 | :--- | :---: | ---: |
-| Jared Matias Neciosup Villarreal |  | jared.neciosup@gmail.com |
-| Ricardo Percy Torres Castañeda |  |   |
-| Gustavo Alonso Vásquez Cruz |  |   |
-| Jostin Rajhúl Murga Quispe |  |  |
-| Jairo Gonzalo Cochachin Falero |  |  |
+| Jared Matias Neciosup Villarreal | Líder de Modelado y Diseño Mecánico | jared.neciosup@upch.pe |
+| Ricardo Percy Torres Castañeda | Líder de Gestión de Proyecto | ricardo.torres@upch.pe  |
+| Gustavo Alonso Vásquez Cruz | Líder de Electrónica y PCB |  gustavo.vasquez@upch.pe |
+| Jostin Rajhúl Murga Quispe | Líder de Software | jostin.murga@upch.pe |
+| Jairo Gonzalo Cochachin Falero | Líder de Investigación Clínica | jairo.cochachin@upch.pe |
