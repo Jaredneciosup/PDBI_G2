@@ -1,5 +1,5 @@
 # PDBI_G2
-Somos el grupo 2 de Biodiseño  
+Somos alumnos del 6to ciclo del curso de Proyectos de Biodiseño.
 Integrantes:
 | Nombres | Rol | Correo |
 | :--- | :---: | ---: |
