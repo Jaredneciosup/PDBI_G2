@@ -11,4 +11,4 @@ Diseñar y desarrollar un dispositivo biomédico que contribuya a mejorar la cal
 | Jostin Rajhúl Murga Quispe | Líder de Software | jostin.murga@upch.pe |
 | Jairo Gonzalo Cochachin Falero | Líder de Investigación Clínica | jairo.cochachin@upch.pe |  
 
-![Foto](WhatsApp Image 2026-08-22 at 9.22.54 AM.jpeg)
+<img src= "WhatsApp Image 2026-08-22 at 9.22.54 AM.jpeg" alt="Foto del equipo" width="100%">
