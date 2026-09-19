@@ -20,28 +20,28 @@ gantt
 
     section Hito 1: Análisis e Investigación
     Búsqueda de información y necesidades  (Todos)  :a1, 2026-08-21, 5d
-    Definición del marco teórico              :a2, 2026-08-22, 5d
-    Ciclo de diseño, IoT y TinyML             :a3, 2026-08-26, 4d
-    Lista de exigencias del proyecto          :a4, 2026-08-28, 6d
-    Estructura de funciones                   :a5, 2026-09-02, 8d
-    Matriz Morfológica                        :a6, 2026-09-09, 8d
-    Diseño enfocado al usuario                :a7, 2026-09-14, 5d
-    Evaluación H1                             :milestone, h1, 2026-09-19, 0d
+    Definición del marco teórico (JM,RT)             :a2, 2026-08-22, 5d
+    Ciclo de diseño, IoT y TinyML  (GV,RT)           :a3, 2026-08-26, 4d
+    Lista de exigencias del proyecto (Todos)       :a4, 2026-08-28, 6d
+    Estructura de funciones  (Todos)                 :a5, 2026-09-02, 8d
+    Matriz Morfológica  (Todos)                      :a6, 2026-09-09, 8d
+    Diseño enfocado al usuario  (JM,JN)              :a7, 2026-09-14, 5d
+    Evaluación H1  (Todos)                           :milestone, h1, 2026-09-19, 0d
 
     section Hito 2: Diseño y Conceptos
-    Concepto de solución óptimo               :b1, 2026-09-20, 10d
-    Entrevista al usuario y Feedback          :b2, 2026-09-27, 8d
-    Proyecto preliminar y Asesoría            :b3, 2026-10-04, 6d
-    Evaluación H2                             :milestone, h2, 2026-10-10, 0d
+    Concepto de solución óptimo  (Todos)             :b1, 2026-09-20, 10d
+    Entrevista al usuario y Feedback  (JM,RT)        :b2, 2026-09-27, 8d
+    Proyecto preliminar y Asesoría  (JC,JN)          :b3, 2026-10-04, 6d
+    Evaluación H2  (Todos)                           :milestone, h2, 2026-10-10, 0d
 
     section Hito 3: Simulación y Prototipado
-    Pruebas en simuladores del proyecto       :c1, 2026-10-11, 14d
-    Pruebas tarjetas prototipado electrónico  :c2, 2026-10-21, 17d
-    Visión del prototipo en CAD               :c3, 2026-11-04, 10d
-    Evaluación H3                             :milestone, h3, 2026-11-14, 0d
+    Pruebas en simuladores del proyecto  (GV,RT)     :c1, 2026-10-11, 14d
+    Pruebas tarjetas prototipado electrónico (GV,JC) :c2, 2026-10-21, 17d
+    Visión del prototipo en CAD  (JN)             :c3, 2026-11-04, 10d
+    Evaluación H3  (Todos)                           :milestone, h3, 2026-11-14, 0d
 
     section Hito 4: Implementación y Validación
-    Validación del prototipo funcional        :d1, 2026-11-15, 8d
-    Construcción del prototipo funcional      :d2, 2026-11-20, 9d
-    Entrevista de solución y validación       :d3, 2026-11-25, 10d
-    Evaluación H4 - Presentación Final        :milestone, h4, 2026-12-05, 0d
+    Validación del prototipo funcional  (JN,GV,RT)      :d1, 2026-11-15, 8d
+    Construcción del prototipo funcional  (JC,GV)    :d2, 2026-11-20, 9d
+    Entrevista de solución y validación  (JM,RT)     :d3, 2026-11-25, 10d
+    Evaluación H4 - Presentación Final  (Todos)      :milestone, h4, 2026-12-05, 0d
