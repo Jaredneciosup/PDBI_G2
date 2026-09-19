@@ -19,7 +19,7 @@ gantt
     title Cronograma de Actividades - Grupo 2 (Gr2)
 
     section Hito 1: Análisis e Investigación
-    Búsqueda de información y necesidades    :a1, 2026-08-21, 5d
+    Búsqueda de información y necesidades  (Todos)  :a1, 2026-08-21, 5d
     Definición del marco teórico              :a2, 2026-08-22, 5d
     Ciclo de diseño, IoT y TinyML             :a3, 2026-08-26, 4d
     Lista de exigencias del proyecto          :a4, 2026-08-28, 6d
