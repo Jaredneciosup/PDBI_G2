@@ -40,6 +40,10 @@ gantt
     Visión del prototipo en CAD  (JN)             :c3, 2026-11-04, 10d
     Evaluación H3  (Todos)                           :milestone, h3, 2026-11-14, 0d
 
+
+https://canva.link/9factg1u1irtwwl
+
+
     section Hito 4: Implementación y Validación
     Validación del prototipo funcional  (JN,GV,RT)      :d1, 2026-11-15, 8d
     Construcción del prototipo funcional  (JC,GV)    :d2, 2026-11-20, 9d
