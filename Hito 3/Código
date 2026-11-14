@@ -1,0 +1,1355 @@
+/*
+  EspiroGuia: fusion del firmware sadsadasdsa.ino con
+  prueba_sensor_de_presion_diferencial.ino
+
+  Placa DE PRUEBA: ESP32-S3 Dev Module / Arduino-ESP32 3.x.
+  EXPERIMENTAL: NO USAR PARA DECISIONES CLINICAS.
+
+  Mantiene las seis UUID BLE, el empaquetado de flujo (5 x [t_centi, flujo_centi]),
+  la telemetria, el RGB, el buzzer y el modo de demostracion opcional.
+
+  Modo REAL (predeterminado): ABP2 a 150 Hz OBJETIVO (frecuencia efectiva por verificar),
+  BME280 una vez antes de la maniobra, tara 1 s, para
+  densidad de aire, Venturi para flujo L/s, integracion a volumen L.
+  Serie: t (tara), m (captura 10 s), S (finaliza + CSV); 115200, Nueva linea.
+  BLE: START:NORMAL/SLOW/COUGH/EARLY inicia captura REAL (hasta 20 s),
+       STOP detiene; publica flujo decimado en UUID existente (~55 Hz).
+       CSV:GET entrega DESPUES las muestras completas por una UUID nueva
+       como paquetes binarios de 20 B; en PC se convierten a CSV con Python.
+  MODE:DEMO activa los escenarios sinteticos del firmware original;
+  MODE:REAL vuelve a los sensores. Reconectar la app al cambiar modo.
+
+  PINES TEMPORALES (ESP32-S3 DEV MODULE):
+    I2C SDA = GPIO8, I2C SCL = GPIO9, ABP EOC = GPIO10 (entrada).
+    Buzzer externo = GPIO11 (probado, activo LOW).
+    RGB externo R=GPIO12, G=GPIO13, B=GPIO14 (probado).
+  Poner ENABLE_BUZZER / ENABLE_RGB_LED a false si los desconectas.
+  Diagnostico bajo demanda por Serial: TEST:LED, TEST:BUZZER, TEST:ALL, TEST:OFF.
+  Las pruebas NO bloquean la captura, BLE ni el sensor.
+  OJO: el RGB INTEGRADO de algunas placas es direccionable (NeoPixel)
+  y NO funciona con tres salidas digitalWrite; NO esta habilitado aqui.
+  Si EOC aun no esta conectado, cambiar USE_ABP_EOC a false (se usara
+  el bit BUSY de la lectura I2C, igual que el sketch anterior).
+
+  Libraries: ESP32 BLE Arduino (con Arduino-ESP32), Adafruit BME280 Library,
+  Adafruit Unified Sensor y dependencias de Adafruit BME280.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <string.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Adafruit_BME280.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+#define SERVICE_UUID   "d1f1e000-a1b2-c3d4-e5f6-000000000001"
+#define SAMPLES_UUID   "d1f1e000-a1b2-c3d4-e5f6-000000000002"
+#define COMMAND_UUID   "d1f1e000-a1b2-c3d4-e5f6-000000000003"
+#define TELEMETRY_UUID "d1f1e000-a1b2-c3d4-e5f6-000000000004"
+#define MODE_UUID      "d1f1e000-a1b2-c3d4-e5f6-000000000005"
+#define SENSORS_UUID   "d1f1e000-a1b2-c3d4-e5f6-000000000006"
+#define CSV_DATA_UUID  "d1f1e000-a1b2-c3d4-e5f6-000000000007"
+
+// Pines GPIO del ESP32-S3, NO numeros de patilla fisica.
+constexpr uint8_t I2C_SDA_PIN = 8;
+constexpr uint8_t I2C_SCL_PIN = 9;
+constexpr uint8_t ABP_EOC_PIN = 10;
+constexpr bool USE_ABP_EOC = true; // EOC conectado a GPIO10; HIGH = listo.
+
+// Actuadores externos validados en la prueba basica sin BLE.
+constexpr bool ENABLE_RGB_LED = true;
+constexpr bool ENABLE_BUZZER = true;
+constexpr uint8_t LED_R = 12;
+constexpr uint8_t LED_G = 13;
+constexpr uint8_t LED_B = 14;
+constexpr bool ANODO_COMUN = true;     // solo para RGB externo de 4 patas.
+constexpr uint8_t BUZZER_PIN = 11;
+constexpr bool BUZZER_ON_LEVEL = LOW; // solo para modulo buzzer activo LOW.
+
+// IMPORTANTISIMO: copiar geometria REAL, no suponer que el beta nominal
+// coincide con un Venturi impreso en 3D.
+constexpr double D_VENTURI_M = 0.040;     // entrada: 40.00 mm
+constexpr double d_VENTURI_M = 0.02391;   // garganta: 23.91 mm
+constexpr double COEF_DESCARGA = 1.0;    // PROVISIONAL: CALIBRAR
+constexpr double SIGNO_PRESION = 1.0;    // invertir a -1 si soplar da dP negativo
+constexpr double BETA = d_VENTURI_M / D_VENTURI_M;
+constexpr double AREA_GARGANTA_M2 = PI * d_VENTURI_M * d_VENTURI_M / 4.0;
+
+constexpr uint8_t ABP_I2C_ADDRESS = 0x28;
+constexpr double ABP_COUNTS_MIN = 1677722.0;
+constexpr double ABP_COUNTS_MAX = 15099494.0;
+constexpr double ABP_PA_PER_INH2O = 249.089;
+constexpr uint32_t SAMPLE_PERIOD_US = 6667UL;      // 149.99 Hz objetivo, NO frecuencia garantizada
+constexpr uint32_t TARE_DURATION_US = 1000000UL;   // 1 s
+constexpr uint32_t SERIAL_DURATION_US = 10000000UL;// 10 s
+constexpr uint32_t BLE_DURATION_US = 20000000UL;   // hasta 20 s, Flutter puede finalizar antes
+constexpr size_t MAX_SERIAL_SAMPLES = 3300; // 20 s x 150 Hz = 3000; reserva 300 registros
+constexpr uint8_t BLE_SAMPLES_PER_PACKET = 5;      // 20 B en MTU 23
+constexpr uint8_t BLE_PREVIEW_DECIMATION = 3;          // 150 Hz / 3 = ~50 Hz en vivo
+constexpr uint32_t CSV_SEND_INTERVAL_MS = 18; // transferencia posterior, NO durante captura
+constexpr uint32_t SENSOR_BLE_INTERVAL_MS = 200;
+// Solo durante la captura REAL: 16.7 notificaciones/s para vista previa.
+// El ABP2 busca 150 Hz, y el CSV guarda TODOS los datos con tiempo real.
+// Subir a 80 ms si la BLE sobrecarga la adquisicion (revisar muestras/Hz CSV).
+constexpr uint32_t SENSOR_BLE_LIVE_INTERVAL_MS = 60;
+
+Adafruit_BME280 bme;
+bool bmeAvailable = false;
+bool abpDetected = false;
+uint8_t abpFailures = 0;
+uint32_t lastAbpProbeMs = 0;
+uint32_t lastAbpValidMs = 0;
+uint32_t lastIdleAbpMs = 0;
+uint32_t lastAmbientMs = 0;
+uint32_t lastAmbientValidMs = 0;
+uint32_t lastSensorBleMs = 0;
+float ambientTemperatureC = NAN;
+float ambientPressurePa = NAN;
+float ambientHumidityPct = NAN;
+float abpDifferentialPa = NAN;
+// Presion diferencial ya corregida con tara de la ULTIMA muestra registrada.
+// La vista BLE no filtra ni altera los registros originales del CSV.
+float abpLiveDifferentialPa = NAN;
+float abpTemperatureC = NAN;
+
+enum DemoType : uint8_t { NORMAL, SLOW, COUGH, EARLY };
+enum class FeedbackType : uint8_t {
+  IDLE, READY, BLOW_HARD, KEEP_BLOWING, GOOD_CONTINUE,
+  SLOW_START, COUGH, EARLY_STOP, ACCEPTABLE, INVALID
+};
+enum class DataMode : uint8_t { REAL = 0, DEMO = 1 };
+enum class CaptureState : uint8_t { IDLE, TARING, MEASURING };
+
+BLEServer* server = nullptr;
+BLECharacteristic* samplesChar = nullptr;
+BLECharacteristic* telemetryChar = nullptr;
+BLECharacteristic* sensorsChar = nullptr;
+BLECharacteristic* modeChar = nullptr;
+BLECharacteristic* csvDataChar = nullptr;
+volatile bool deviceConnected = false;
+volatile bool disconnectPending = false;
+volatile FeedbackType feedback = FeedbackType::IDLE;
+volatile uint32_t feedbackSinceMs = 0;
+DataMode dataMode = DataMode::REAL;     // nunca simular sin activacion explicita
+DemoType scenario = NORMAL;
+CaptureState captureState = CaptureState::IDLE;
+bool runningDemo = false;
+uint32_t sampleIndex = 0;
+uint32_t lastDemoPacketMs = 0;
+uint32_t lastTelemetryMs = 0;
+
+// BLE callback se ejecuta en otra tarea: solo encola mensajes, nunca toca I2C.
+struct BleCommand { char text[64]; };
+QueueHandle_t bleCommands = nullptr;
+
+// Variables de tara/medicion de sensor real (accedidas solo desde loop()).
+struct FlowRecord {
+  uint32_t tiempoUs;
+  float dpPa;
+  float flujoLs;
+  float volumenL;
+  float tempAbpC;
+};
+FlowRecord csvSamples[MAX_SERIAL_SAMPLES];
+size_t csvCount = 0;
+bool csvRequested = false;
+bool tareReady = false;
+bool startAfterTare = false;
+double tareOffsetPa = 0;
+double airDensityKgM3 = NAN;
+double tareSumPa = 0;
+double tareSumTemp = 0;
+uint16_t tareValidCount = 0;
+uint16_t missedPeriods = 0;
+uint16_t badReads = 0;
+uint32_t stateStartedUs = 0;
+uint32_t nextSampleUs = 0;
+uint32_t abpCommandSentUs = 0;
+bool conversionPending = false;
+uint32_t lastFlowSampleUs = 0;
+double previousFlowLs = 0;
+double volumeL = 0;
+uint16_t validFlowSamples = 0;
+uint8_t bleDecimation = 0;
+uint8_t blePacket[BLE_SAMPLES_PER_PACKET * 4];
+uint8_t blePacketCount = 0;
+// Descarga historica BLE: 1 registro binario de 20 bytes por notificacion.
+// Indices 0..N-1, 0xFFFF=encabezado, 0xFFFE=fin de transferencia.
+bool csvTransferActive = false;
+uint16_t csvTransferIndex = 0;
+uint32_t csvLastSendMs = 0;
+bool csvOverflow = false;
+uint32_t firstRecordUs = 0;
+uint32_t lastRecordUs = 0;
+float lastMeasuredHz = 0.0f;
+static_assert(sizeof(float) == 4, "Requiere float IEEE754 de 32 bits");
+
+// Para que las caracteristicas BLE sigan usando exactamente el formato previo.
+void put16le(uint8_t* p, uint16_t value) {
+  p[0] = uint8_t(value);
+  p[1] = uint8_t(value >> 8);
+}
+void put32le(uint8_t* p, uint32_t value) {
+  p[0] = uint8_t(value);
+  p[1] = uint8_t(value >> 8);
+  p[2] = uint8_t(value >> 16);
+  p[3] = uint8_t(value >> 24);
+}
+int16_t clamp16(long value) {
+  if (value > 32767) return 32767;
+  if (value < -32768) return -32768;
+  return int16_t(value);
+}
+
+void updateModeCharacteristic() {
+  if (!modeChar) return;
+  uint8_t mode = uint8_t(dataMode);
+  modeChar->setValue(&mode, 1);
+}
+
+void probeAbp() {
+  lastAbpProbeMs = millis();
+  Wire.beginTransmission(ABP_I2C_ADDRESS);
+  bool detected = Wire.endTransmission() == 0;
+  if (detected != abpDetected) {
+    Serial.println(detected ? "ABP2 detectado en 0x28" : "ABP2 sin respuesta en 0x28");
+  }
+  abpDetected = detected;
+  if (detected) abpFailures = 0;
+  else { lastAbpValidMs = 0; tareReady = false; }
+}
+
+void initSensors() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  Wire.setTimeOut(10);
+  bmeAvailable = bme.begin(0x76, &Wire);
+  if (!bmeAvailable) bmeAvailable = bme.begin(0x77, &Wire);
+  if (bmeAvailable) {
+    bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::FILTER_OFF,
+                    Adafruit_BME280::STANDBY_MS_1000);
+    Serial.println("BME280 detectado");
+  } else {
+    Serial.println("BME280 NO detectado; comprobar 0x76/0x77 y cableado.");
+  }
+  probeAbp();
+}
+
+bool refreshAmbient(bool verbose = false) {
+  if (!bmeAvailable) return false;
+  if (!bme.takeForcedMeasurement()) return false;
+  double temperature = bme.readTemperature();
+  double pressure = bme.readPressure();
+  double humidity = bme.readHumidity();
+  if (!isfinite(temperature) || !isfinite(pressure) || !isfinite(humidity) ||
+      pressure <= 0 || humidity < 0 || humidity > 100 || temperature < -40 ||
+      temperature > 85) {
+    if (verbose) Serial.println("BME280 lectura invalida");
+    return false;
+  }
+  ambientTemperatureC = (float)temperature;
+  ambientPressurePa = (float)pressure;
+  ambientHumidityPct = (float)humidity;
+  lastAmbientValidMs = millis();
+  if (verbose) {
+    Serial.printf("BME280 T=%.2f C, P=%.2f hPa, HR=%.1f %%\n",
+                  temperature, pressure / 100.0, humidity);
+  }
+  return true;
+}
+
+// Honeywell ABP2: el comando inicia la conversion. Se completa de forma
+// NO BLOQUEANTE en serviceCapture() tras esperar >=5 ms o BUSY=0.
+bool beginAbpConversion(uint32_t nowUs) {
+  Wire.beginTransmission(ABP_I2C_ADDRESS);
+  Wire.write(0xAA);
+  Wire.write(0x00);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  abpCommandSentUs = nowUs;
+  conversionPending = true;
+  return true;
+}
+
+// Entrega true solo para una lectura NUEVA ya lista y valida.
+// Si BUSY sigue a 1, se reintentara sin bloquear la ejecucion.
+// Declaracion explicita: evita que Arduino genere un prototipo
+// antes de conocer AbpReadStatus (error en IDE).
+enum class AbpReadStatus : uint8_t { WAITING, GOOD, ERROR };
+AbpReadStatus finishAbpConversion(double& pressurePa, double& temperatureC);
+
+AbpReadStatus finishAbpConversion(double& pressurePa, double& temperatureC) {
+  uint32_t elapsed = (uint32_t)(micros() - abpCommandSentUs);
+  if (elapsed < 5000UL) return AbpReadStatus::WAITING;
+  // Honeywell ABP2 (modo sleep): EOC pasa de LOW a HIGH cuando termina
+  // la conversion. Si el EOC no esta conectado, desactivar USE_ABP_EOC.
+  if (USE_ABP_EOC && digitalRead(ABP_EOC_PIN) == LOW) {
+    return (elapsed >= 9500UL) ? AbpReadStatus::ERROR : AbpReadStatus::WAITING;
+  }
+  uint8_t bytes[7];
+  if (Wire.requestFrom(ABP_I2C_ADDRESS, (uint8_t)7) != 7) {
+    while (Wire.available()) Wire.read();
+    return AbpReadStatus::ERROR;
+  }
+  for (uint8_t i = 0; i < 7; ++i) bytes[i] = Wire.read();
+  const uint8_t status = bytes[0];
+  // Bit 6=encendido, bit 5=busy, bit 2=error, bit 0=saturacion.
+  if ((status & 0x40) == 0 || (status & 0x05) != 0) return AbpReadStatus::ERROR;
+  if ((status & 0x20) != 0) {
+    return (elapsed >= 9500UL) ? AbpReadStatus::ERROR : AbpReadStatus::WAITING;
+  }
+  const uint32_t pc = (uint32_t(bytes[1]) << 16) |
+                      (uint32_t(bytes[2]) << 8) | uint32_t(bytes[3]);
+  const uint32_t tc = (uint32_t(bytes[4]) << 16) |
+                      (uint32_t(bytes[5]) << 8) | uint32_t(bytes[6]);
+  if (pc <= ABP_COUNTS_MIN || pc >= ABP_COUNTS_MAX) return AbpReadStatus::ERROR;
+  pressurePa = ((double(pc) - ABP_COUNTS_MIN) * 4.0 /
+                (ABP_COUNTS_MAX - ABP_COUNTS_MIN) - 2.0) * ABP_PA_PER_INH2O;
+  temperatureC = double(tc) * 200.0 / 16777215.0 - 50.0;
+  if (!isfinite(pressurePa) || !isfinite(temperatureC)) return AbpReadStatus::ERROR;
+  abpDifferentialPa = float(pressurePa);
+  abpTemperatureC = float(temperatureC);
+  lastAbpValidMs = millis();
+  abpFailures = 0;
+  return AbpReadStatus::GOOD;
+}
+
+// Al estar inactivo se conserva la telemetria real de presion del firmware
+// original (~10 Hz). Solo esta rutina de diagnostico puede esperar 5 ms;
+// durante las capturas la adquisicion sigue siendo NO BLOQUEANTE.
+void refreshIdleAbp() {
+  if (captureState != CaptureState::IDLE || !abpDetected) return;
+  const uint32_t beginUs = micros();
+  if (!beginAbpConversion(beginUs)) {
+    if (++abpFailures >= 15) {
+      abpDetected = false;
+      lastAbpValidMs = 0;
+      tareReady = false;
+    }
+    return;
+  }
+  double dp = NAN, temp = NAN;
+  bool gotSample = false;
+  while ((uint32_t)(micros() - beginUs) < 9500UL) {
+    const AbpReadStatus result = finishAbpConversion(dp, temp);
+    if (result == AbpReadStatus::GOOD) { gotSample = true; break; }
+    if (result == AbpReadStatus::ERROR) break;
+    delayMicroseconds(150);
+  }
+  conversionPending = false;
+  if (!gotSample && ++abpFailures >= 15) {
+    abpDetected = false;
+    lastAbpValidMs = 0;
+    tareReady = false;
+    Serial.println("# ABP2: perdida la comunicacion en reposo");
+  }
+}
+
+void publishSensorReadings() {
+  if (!deviceConnected || sensorsChar == nullptr) return;
+  uint32_t now = millis();
+  const bool ambientOk = bmeAvailable && lastAmbientValidMs != 0 &&
+      isfinite(ambientTemperatureC) && isfinite(ambientPressurePa);
+  const bool inManeuver = captureState == CaptureState::MEASURING;
+  const float pressureToSend = inManeuver ? abpLiveDifferentialPa : abpDifferentialPa;
+  const bool abpOk = abpDetected && lastAbpValidMs != 0 &&
+      (uint32_t)(now - lastAbpValidMs) < 800 && isfinite(pressureToSend);
+  // Se conserva el paquete de 14 B de Flutter, aunque ahora el ambiente
+  // procede de BME280 (los bits 0-1 denotan temperatura y P atmosferica).
+  uint8_t packet[14] = {0};
+  packet[0] = 1;
+  // Bit 3 = maniobra REAL activa, con presion corregida por tara.
+  // Fuera de la maniobra se mantienen el paquete y los flags anteriores.
+  packet[1] = (ambientOk ? 0x03 : 0) | (abpOk ? 0x04 : 0) |
+              ((inManeuver && abpOk) ? 0x08 : 0);
+  put32le(packet + 2, now);
+  if (ambientOk) {
+    put16le(packet + 6, uint16_t(clamp16(lroundf(ambientTemperatureC * 100))));
+    put32le(packet + 8, uint32_t(lroundf(ambientPressurePa)));
+  }
+  if (abpOk) {
+    put16le(packet + 12, uint16_t(clamp16(lroundf(pressureToSend * 10))));
+  }
+  sensorsChar->setValue(packet, sizeof(packet));
+  sensorsChar->notify();
+}
+
+bool buzzerTestActive = false;
+uint32_t buzzerTestStartedMs = 0;
+bool ledTestActive = false;
+uint32_t ledTestStartedMs = 0;
+enum class CueType : uint8_t { NONE, START, END, ERROR };
+// Prototipo explícito: evita que Arduino adelante cueSound antes del enum.
+void cueSound(CueType next);
+CueType cue = CueType::NONE;
+uint32_t cueSinceMs = 0;
+uint32_t finishedLedSinceMs = 0;
+void cueSound(CueType next) {
+  cue = next;
+  cueSinceMs = millis();
+}
+
+// En anodo comun: LOW en el GPIO enciende ese color, HIGH lo apaga.
+// Cada canal necesita SU PROPIA resistencia (220-330 ohmios).
+void setRgb(bool red, bool green, bool blue) {
+  if (!ENABLE_RGB_LED) return;
+  digitalWrite(LED_R, red   == ANODO_COMUN ? LOW : HIGH);
+  digitalWrite(LED_G, green == ANODO_COMUN ? LOW : HIGH);
+  digitalWrite(LED_B, blue  == ANODO_COMUN ? LOW : HIGH);
+}
+
+// Se ejecuta en cada iteracion, sin delay bloqueante ni pulsos desde Flutter.
+// Los patrones continúan solos hasta recibir un nuevo FB:..., o desconectarse.
+void updateLed() {
+  if (!ENABLE_RGB_LED) return;
+  // Prueba manual con prioridad sobre el feedback BLE. 4 colores x 600 ms.
+  if (ledTestActive) {
+    const uint32_t testElapsed = (uint32_t)(millis() - ledTestStartedMs);
+    if (testElapsed < 2400UL) {
+      switch (testElapsed / 600UL) {
+        case 0: setRgb(true, false, false); break;   // rojo
+        case 1: setRgb(false, true, false); break;   // verde
+        case 2: setRgb(false, false, true); break;   // azul
+        default: setRgb(true, true, false); break;  // amarillo
+      }
+      return;
+    }
+    ledTestActive = false;
+    Serial.println("# TEST:LED terminado");
+  }
+  // Estado autonomo de captura; feedback Flutter se superpone solo en maniobra.
+  if (captureState == CaptureState::TARING) {
+    setRgb(false, false, (millis() % 600) < 250); // azul: no soplar
+    return;
+  }
+  if (captureState == CaptureState::IDLE && finishedLedSinceMs &&
+      (uint32_t)(millis() - finishedLedSinceMs) < 1500UL) {
+    setRgb(false, true, false); // verde: captura completada
+    return;
+  }
+  const uint32_t elapsed = millis() - feedbackSinceMs;
+  const FeedbackType state = feedback;
+  bool red = false;
+  bool green = false;
+  bool blue = false;
+
+  switch (state) {
+    case FeedbackType::IDLE: break; // apagado
+    case FeedbackType::READY:
+      blue = (elapsed % 1400) < 250; // destello azul lento
+      break;
+    case FeedbackType::BLOW_HARD:
+      red = green = (elapsed % 360) < 180; // amarillo rapido
+      break;
+    case FeedbackType::KEEP_BLOWING:
+      red = green = (elapsed % 1200) < 750; // amarillo pausado
+      break;
+    case FeedbackType::GOOD_CONTINUE:
+      green = (elapsed % 900) < 700; // verde pulsante
+      break;
+    case FeedbackType::SLOW_START: {
+      const uint32_t t = elapsed % 1250;
+      red = green = (t < 130 || (t >= 260 && t < 390)); // doble amarillo
+      break;
+    }
+    case FeedbackType::COUGH: {
+      const uint32_t t = elapsed % 1400;
+      red = t < 120 || (t >= 240 && t < 360) || (t >= 480 && t < 600);
+      break; // triple rojo
+    }
+    case FeedbackType::EARLY_STOP:
+      red = (elapsed % 350) < 120; // rojo rapido
+      break;
+    case FeedbackType::ACCEPTABLE:
+      green = true; // verde constante
+      break;
+    case FeedbackType::INVALID:
+      red = true; // rojo constante
+      break;
+  }
+  if (captureState == CaptureState::MEASURING && state == FeedbackType::IDLE)
+    green = true; // medicion activa, sin feedback de la app
+  setRgb(red, green, blue);
+}
+
+// El zumbador NO sigue los parpadeos del LED. Cada evento crea un patron
+// audible independiente calculado localmente por millis(); el telefono
+// solo manda el significado del feedback (FB:...).
+// Evitamos sonidos prolongados, especialmente en KEEP_BLOWING.
+void updateBuzzer() {
+  if (!ENABLE_BUZZER) return;
+  // Tres pitidos cortos sin bloquear loop() ni mantener el zumbador encendido.
+  // Solo para buzzer ACTIVO, cuya polaridad se define en BUZZER_ON_LEVEL.
+  if (buzzerTestActive) {
+    const uint32_t testElapsed = (uint32_t)(millis() - buzzerTestStartedMs);
+    if (testElapsed < 1200UL) {
+      const bool sound = (testElapsed % 400UL) < 120UL;
+      digitalWrite(BUZZER_PIN, sound ? BUZZER_ON_LEVEL : !BUZZER_ON_LEVEL);
+      return;
+    }
+    buzzerTestActive = false;
+    Serial.println("# TEST:BUZZER terminado");
+  }
+  // Señal local de inicio/fin con prioridad sobre los mensajes recibidos por BLE.
+  const uint32_t cueElapsed = (uint32_t)(millis() - cueSinceMs);
+  if (cue != CueType::NONE) {
+    bool tone = false;
+    uint32_t durationMs = 0;
+    if (cue == CueType::START) {
+      durationMs = 180; tone = cueElapsed < 130;
+    } else if (cue == CueType::END) {
+      durationMs = 520;
+      tone = cueElapsed < 120 || (cueElapsed >= 230 && cueElapsed < 350);
+    } else {
+      durationMs = 900;
+      tone = cueElapsed < 130 || (cueElapsed >= 250 && cueElapsed < 380) ||
+             (cueElapsed >= 500 && cueElapsed < 630);
+    }
+    if (cueElapsed < durationMs) {
+      digitalWrite(BUZZER_PIN, tone ? BUZZER_ON_LEVEL : !BUZZER_ON_LEVEL);
+      return;
+    }
+    cue = CueType::NONE;
+  }
+  if (captureState == CaptureState::TARING) {
+    digitalWrite(BUZZER_PIN, !BUZZER_ON_LEVEL);
+    return;
+  }
+  const uint32_t elapsed = millis() - feedbackSinceMs;
+  const FeedbackType state = feedback;
+  bool sound = false;
+  switch (state) {
+    case FeedbackType::IDLE:
+      break;
+    case FeedbackType::READY:
+      sound = elapsed < 95; // aviso breve de preparado
+      break;
+    case FeedbackType::BLOW_HARD:
+      sound = (elapsed < 95) || (elapsed >= 210 && elapsed < 305);
+      break;
+    case FeedbackType::KEEP_BLOWING:
+      sound = (elapsed % 3500) < 95; // recordatorio muy breve cada 3.5 s
+      break;
+    case FeedbackType::GOOD_CONTINUE:
+      sound = elapsed < 75; // confirmacion breve
+      break;
+    case FeedbackType::SLOW_START:
+      sound = (elapsed < 120) || (elapsed >= 240 && elapsed < 360);
+      break;
+    case FeedbackType::COUGH:
+      sound = (elapsed < 125) || (elapsed >= 250 && elapsed < 375) ||
+              (elapsed >= 500 && elapsed < 625);
+      break;
+    case FeedbackType::EARLY_STOP:
+      sound = (elapsed < 180) || (elapsed >= 340 && elapsed < 520);
+      break;
+    case FeedbackType::ACCEPTABLE:
+      sound = (elapsed < 110) || (elapsed >= 210 && elapsed < 320);
+      break;
+    case FeedbackType::INVALID:
+      sound = (elapsed < 180) || (elapsed >= 340 && elapsed < 520) ||
+              (elapsed >= 680 && elapsed < 860);
+      break;
+  }
+  digitalWrite(BUZZER_PIN, sound ? BUZZER_ON_LEVEL : !BUZZER_ON_LEVEL);
+}
+
+// Prueba autonoma al encender: NO requiere celular ni BLE.
+// Esta rutina es solo de diagnostico. Despues continua el firmware original.
+void hardwareSelfTest() {
+  if (!ENABLE_RGB_LED && !ENABLE_BUZZER) {
+    Serial.println("# Actuadores DESHABILITADOS: omitiendo autoprueba RGB/buzzer");
+    return;
+  }
+  Serial.println("=== AUTOPRUEBA DE ACTUADORES EXTERNOS ===");
+  if (ENABLE_RGB_LED) {
+    Serial.printf("ROJO - GPIO%u\n", LED_R);
+    setRgb(true, false, false); delay(900);
+    Serial.printf("VERDE - GPIO%u\n", LED_G);
+    setRgb(false, true, false); delay(900);
+    Serial.printf("AZUL - GPIO%u\n", LED_B);
+    setRgb(false, false, true); delay(900);
+    Serial.printf("AMARILLO - GPIO%u + GPIO%u\n", LED_R, LED_G);
+    setRgb(true, true, false); delay(900);
+    setRgb(false, false, false);
+  }
+  if (ENABLE_BUZZER) {
+    Serial.printf("BUZZER - GPIO%u por 3 segundos\n", BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, BUZZER_ON_LEVEL);
+    delay(3000);
+    digitalWrite(BUZZER_PIN, !BUZZER_ON_LEVEL);
+  }
+  Serial.println("=== FIN AUTOPRUEBA ===");
+}
+
+void sendTelemetry() {
+  if (!deviceConnected || telemetryChar == nullptr) return;
+  uint8_t packet[12];
+  put32le(packet, millis());
+  put32le(packet + 4, ESP.getFreeHeap());
+  put32le(packet + 8, ESP.getCpuFreqMHz());
+  telemetryChar->setValue(packet, sizeof(packet));
+  telemetryChar->notify();
+}
+
+// Se conserva esta DEMO para las pruebas sin ESP32 conectado a un Venturi.
+double syntheticFlow(double t) {
+  if (t < 0 || t > 9) return 0;
+  const DemoType kind = scenario;
+  if (kind == EARLY && t >= 2.0) return 0;
+  if (kind == COUGH && t >= 0.50 && t <= 0.72) return 0.05;
+  const double rise = kind == SLOW ? 0.95 : 0.10;
+  const double amplitude = kind == SLOW ? 4.4 : 4.8;
+  return amplitude * (1.0 - exp(-t / rise)) * exp(-t / 1.16);
+}
+
+void sendSyntheticSamples() {
+  if (!runningDemo || !deviceConnected || !samplesChar) return;
+  uint8_t packet[BLE_SAMPLES_PER_PACKET * 4];
+  for (uint8_t i = 0; i < BLE_SAMPLES_PER_PACKET; ++i) {
+    const double t = sampleIndex * 0.020; // 50 Hz
+    if (t >= 9.5) { runningDemo = false; return; }
+    const int16_t flowCenti = clamp16(lround(syntheticFlow(t) * 100.0));
+    const uint16_t tCenti = uint16_t(sampleIndex * 2);
+    put16le(packet + 4 * i, tCenti);
+    put16le(packet + 4 * i + 2, uint16_t(flowCenti));
+    ++sampleIndex;
+  }
+  samplesChar->setValue(packet, sizeof(packet));
+  samplesChar->notify();
+}
+
+void printStatus() {
+  Serial.printf("# MODO=%s | ESTADO=%u | ABP2=%s | BME280=%s | TARA=%s\n",
+    dataMode == DataMode::REAL ? "REAL" : "DEMO", unsigned(captureState),
+    abpDetected ? "OK" : "NO", bmeAvailable ? "OK" : "NO",
+    tareReady ? "OK" : "NO");
+  Serial.printf("# PINES: SDA=%u SCL=%u EOC=%u (uso=%s, nivel=%d)\n",
+    I2C_SDA_PIN, I2C_SCL_PIN, ABP_EOC_PIN,
+    USE_ABP_EOC ? "SI" : "NO", digitalRead(ABP_EOC_PIN));
+  Serial.printf("# ACTUADORES: RGB=%s, BUZZER=%s\n",
+    ENABLE_RGB_LED ? "HABILITADO" : "DESHABILITADO",
+    ENABLE_BUZZER ? "HABILITADO" : "DESHABILITADO");
+  Serial.printf("# dP_RAW=%.3f Pa | offset=%.3f Pa | densidad=%.5f kg/m3\n",
+    abpDifferentialPa, tareOffsetPa, airDensityKgM3);
+  Serial.printf("# Venturi D=%.2f mm, d=%.2f mm, beta=%.5f, Cd=%.3f, signo=%.0f\n",
+    D_VENTURI_M * 1000, d_VENTURI_M * 1000, BETA,
+    COEF_DESCARGA, SIGNO_PRESION);
+  Serial.printf("# Muestras=%u, CSV=%u, Hz_real=%.2f, periodos perdidos=%u, lecturas fallidas=%u\n",
+    unsigned(validFlowSamples), unsigned(csvCount), lastMeasuredHz,
+    unsigned(missedPeriods), unsigned(badReads));
+}
+
+bool startTare(bool autoStartAfterTare) {
+  if (captureState != CaptureState::IDLE || runningDemo) {
+    Serial.println("# ERROR: terminar la medicion antes de tarear.");
+    return false;
+  }
+  if (!abpDetected || !bmeAvailable) {
+    Serial.println("# ERROR: se requieren ABP2 + BME280 para modo REAL.");
+    tareReady = false;
+    return false;
+  }
+  if (!refreshAmbient(true)) {
+    Serial.println("# ERROR: no se pudo leer BME280 para la tara.");
+    tareReady = false;
+    return false;
+  }
+  // Densidad del aire HUMEDO como en el sketch de prueba.
+  const double tK = double(ambientTemperatureC) + 273.15;
+  const double pSat = 610.94 * exp(17.625 * ambientTemperatureC /
+                                 (ambientTemperatureC + 243.04));
+  const double pVapor = (ambientHumidityPct / 100.0) * pSat;
+  double rho = (ambientPressurePa - pVapor) / (287.05 * tK) +
+               pVapor / (461.5 * tK);
+  if (!isfinite(rho) || rho <= 0 || rho > 3.0) {
+    Serial.println("# ERROR: densidad de aire invalida.");
+    tareReady = false;
+    return false;
+  }
+  airDensityKgM3 = rho;
+  tareReady = false;
+  startAfterTare = autoStartAfterTare;
+  tareSumPa = 0;
+  tareSumTemp = 0;
+  tareValidCount = 0;
+  badReads = 0;
+  missedPeriods = 0;
+  conversionPending = false;
+  stateStartedUs = micros();
+  nextSampleUs = stateStartedUs;
+  captureState = CaptureState::TARING;
+  Serial.println("# TARA INICIADA: mantener el Venturi SIN FLUJO 1 segundo.");
+  return true;
+}
+
+bool startRealCapture(bool printCsv) {
+  if (captureState != CaptureState::IDLE || runningDemo) return false;
+  if (dataMode != DataMode::REAL || !abpDetected || !bmeAvailable ||
+      !tareReady || !isfinite(airDensityKgM3) || airDensityKgM3 <= 0) {
+    Serial.println("# ERROR: faltan sensores o tara. Enviar t antes de m.");
+    return false;
+  }
+  csvRequested = printCsv;
+  csvTransferActive = false;
+  csvOverflow = false;
+  csvCount = 0;
+  abpLiveDifferentialPa = NAN;
+  firstRecordUs = 0;
+  lastRecordUs = 0;
+  lastMeasuredHz = 0;
+  // START despues de completar la tara: 1 pitido = comenzar a soplar.
+  cueSound(CueType::START);
+  finishedLedSinceMs = 0;
+  volumeL = 0;
+  previousFlowLs = 0;
+  lastFlowSampleUs = 0;
+  validFlowSamples = 0;
+  missedPeriods = 0;
+  badReads = 0;
+  blePacketCount = 0;
+  bleDecimation = 0;
+  conversionPending = false;
+  stateStartedUs = micros();
+  nextSampleUs = stateStartedUs;
+  captureState = CaptureState::MEASURING;
+  Serial.printf("# MEDICION REAL INICIADA | %s | limite=%u s\n",
+    printCsv ? "CSV por SERIAL" : "flujo por BLE",
+    unsigned(printCsv ? SERIAL_DURATION_US / 1000000UL : BLE_DURATION_US / 1000000UL));
+  return true;
+}
+
+void printCsv() {
+  Serial.println("# BEGIN");
+  Serial.printf("# BME280_UNA_LECTURA: T=%.3f C, P=%.2f Pa, HR=%.2f %%\n",
+                ambientTemperatureC, ambientPressurePa, ambientHumidityPct);
+  Serial.printf("# FRECUENCIA_REAL_HZ=%.3f, MUESTRAS=%u, PERDIDAS=%u, ERRORES=%u\n",
+                lastMeasuredHz, unsigned(csvCount), unsigned(missedPeriods), unsigned(badReads));
+  Serial.println("tiempo_s,dp_Pa,flujo_Ls,volumen_L,temp_ABP_C");
+  for (size_t i = 0; i < csvCount; ++i) {
+    const FlowRecord& r = csvSamples[i];
+    Serial.printf("%.6f,%.5f,%.6f,%.6f,%.3f\n",
+      r.tiempoUs / 1000000.0, r.dpPa, r.flujoLs,
+      r.volumenL, r.tempAbpC);
+  }
+  Serial.println("# END");
+}
+
+void finishRealCapture(const char* reason) {
+  if (captureState != CaptureState::MEASURING) return;
+  captureState = CaptureState::IDLE;
+  conversionPending = false;
+  // El formato BLE admite paquetes de 4 B por muestra. Al cerrar,
+  // publicamos el lote parcial para no perder los ultimos puntos.
+  if (!csvRequested && deviceConnected && samplesChar && blePacketCount > 0) {
+    samplesChar->setValue(blePacket, blePacketCount * 4);
+    samplesChar->notify();
+  }
+  blePacketCount = 0;
+  if (csvCount > 1 && lastRecordUs > firstRecordUs) {
+    lastMeasuredHz = float((csvCount - 1) * 1000000.0 /
+                           double(lastRecordUs - firstRecordUs));
+  }
+  finishedLedSinceMs = millis();
+  feedback = FeedbackType::IDLE;
+  feedbackSinceMs = millis();
+  cueSound(CueType::END);
+  Serial.printf("# FRECUENCIA REAL=%.2f Hz (objetivo experimental=150) | registros=%u | overflow=%s\n",
+                lastMeasuredHz, unsigned(csvCount), csvOverflow ? "SI" : "NO");
+  if (lastMeasuredHz < 145.0f)
+    Serial.println("# AVISO: tasa efectiva <145 Hz; revisar periodos perdidos, BLE e I2C.");
+  Serial.printf("# MEDICION TERMINADA: %s | validas=%u | periodos_perdidos=%u | errores=%u\n",
+    reason, unsigned(validFlowSamples), unsigned(missedPeriods), unsigned(badReads));
+  if (csvRequested) {
+    printCsv();
+    Serial.println("# Listo: m para otra captura; t para nueva tara.");
+  }
+  csvRequested = false;
+}
+
+void finishTare() {
+  if (captureState != CaptureState::TARING) return;
+  captureState = CaptureState::IDLE;
+  conversionPending = false;
+  if (tareValidCount < 90) {
+    tareReady = false;
+    Serial.printf("# ERROR DE TARA: %u muestras validas (minimo 90). Repetir t.\n",
+                  unsigned(tareValidCount));
+    startAfterTare = false;
+    cueSound(CueType::ERROR);
+    return;
+  }
+  tareOffsetPa = tareSumPa / tareValidCount;
+  tareReady = true;
+  Serial.printf("# TARA TERMINADA: offset=%.4f Pa, T_ABP2=%.2f C, n=%u\n",
+    tareOffsetPa, tareSumTemp / tareValidCount, unsigned(tareValidCount));
+  Serial.printf("# Densidad=%.6f kg/m3 | BME T=%.2f C, P=%.2f hPa, HR=%.1f %%\n",
+    airDensityKgM3, ambientTemperatureC, ambientPressurePa / 100.0,
+    ambientHumidityPct);
+  if (startAfterTare) {
+    startAfterTare = false;
+    startRealCapture(false);
+  }
+}
+
+void pushBleSample(uint32_t sampleUs, double flowLs) {
+  if (!deviceConnected || !samplesChar || csvRequested) return;
+  // Decimacion 150 -> ~50 Hz para la vista BLE, sin alterar el CSV.
+  // Evita enviar 75 Hz al celular, que pasaria con el divisor antiguo de 2.
+  if (++bleDecimation < BLE_PREVIEW_DECIMATION) return;
+  bleDecimation = 0;
+  const uint32_t elapsedUs = (uint32_t)(sampleUs - stateStartedUs);
+  const uint16_t centiseconds = uint16_t((elapsedUs + 5000UL) / 10000UL);
+  const int16_t centilitersPerSec = clamp16(lround(flowLs * 100.0));
+  const uint8_t i = blePacketCount;
+  put16le(blePacket + i * 4, centiseconds);
+  put16le(blePacket + i * 4 + 2, uint16_t(centilitersPerSec));
+  ++blePacketCount;
+  if (blePacketCount == BLE_SAMPLES_PER_PACKET) {
+    samplesChar->setValue(blePacket, sizeof(blePacket));
+    samplesChar->notify();
+    blePacketCount = 0;
+  }
+}
+
+void handleAbpSample(uint32_t sampleUs, double dpRawPa, double tempC) {
+  if (captureState == CaptureState::TARING) {
+    tareSumPa += dpRawPa;
+    tareSumTemp += tempC;
+    ++tareValidCount;
+    return;
+  }
+  if (captureState != CaptureState::MEASURING) return;
+  // Misma formulacion de prueba_sensor_de_presion_diferencial.ino.
+  const double dp = SIGNO_PRESION * (dpRawPa - tareOffsetPa);
+  double flow = COEF_DESCARGA * AREA_GARGANTA_M2 *
+    sqrt(2.0 * fabs(dp) / (airDensityKgM3 * (1.0 - pow(BETA, 4)))) * 1000.0;
+  if (dp < 0) flow = -flow;
+  if (!isfinite(flow)) {
+    ++badReads;
+    return;
+  }
+  if (lastFlowSampleUs != 0) {
+    const double dt = (uint32_t)(sampleUs - lastFlowSampleUs) / 1000000.0;
+    volumeL += 0.5 * (previousFlowLs + flow) * dt;
+  }
+  lastFlowSampleUs = sampleUs;
+  previousFlowLs = flow;
+  ++validFlowSamples;
+  // Guardar SIEMPRE las muestras originales, tanto al medir por BLE como por USB.
+  if (csvCount < MAX_SERIAL_SAMPLES) {
+    FlowRecord& record = csvSamples[csvCount++];
+    record.tiempoUs = (uint32_t)(sampleUs - stateStartedUs);
+    record.dpPa = float(dp);
+    abpLiveDifferentialPa = record.dpPa; // solo muestras guardadas; misma tara que el CSV
+    record.flujoLs = float(flow);
+    record.volumenL = float(volumeL);
+    record.tempAbpC = float(tempC);
+    if (firstRecordUs == 0) firstRecordUs = sampleUs;
+    lastRecordUs = sampleUs;
+  } else csvOverflow = true;
+  pushBleSample(sampleUs, flow);
+}
+
+// Una maquina de estados adquiere el ABP2 SIN delay(8) y deja al BLE,
+// al LED y al buzzer tiempo para actualizarse.
+void serviceCapture() {
+  if (captureState == CaptureState::IDLE) return;
+  uint32_t nowUs = micros();
+  const uint32_t duration = (captureState == CaptureState::TARING) ?
+    TARE_DURATION_US : (csvRequested ? SERIAL_DURATION_US : BLE_DURATION_US);
+  if ((uint32_t)(nowUs - stateStartedUs) >= duration) {
+    if (captureState == CaptureState::TARING) finishTare();
+    else finishRealCapture("tiempo maximo");
+    return;
+  }
+
+  if (conversionPending) {
+    double pressurePa, tempC;
+    const AbpReadStatus result = finishAbpConversion(pressurePa, tempC);
+    if (result == AbpReadStatus::WAITING) return;
+    conversionPending = false;
+    if (result == AbpReadStatus::GOOD) {
+      abpFailures = 0;
+      handleAbpSample(micros(), pressurePa, tempC);
+    } else {
+      ++badReads;
+      ++abpFailures;
+      if (abpFailures >= 15) {
+        Serial.println("# ERROR ABP2: 15 fallos consecutivos. Captura cancelada.");
+        abpDetected = false;
+        tareReady = false;
+        if (captureState == CaptureState::TARING) {
+          captureState = CaptureState::IDLE;
+          startAfterTare = false;
+        } else finishRealCapture("error ABP2 / posible saturacion");
+        return;
+      }
+    }
+  }
+
+  nowUs = micros();
+  if ((int32_t)(nowUs - nextSampleUs) < 0 || conversionPending) return;
+  // Si el BLE/I2C demora, saltamos la ranura, SIN inventar una muestra.
+  if ((uint32_t)(nowUs - nextSampleUs) >= SAMPLE_PERIOD_US) {
+    ++missedPeriods;
+    nextSampleUs = nowUs;
+  }
+  nextSampleUs += SAMPLE_PERIOD_US;
+  if (!beginAbpConversion(micros())) {
+    ++badReads;
+    ++abpFailures;
+    if (abpFailures >= 15) {
+      Serial.println("# ERROR ABP2: sensor sin respuesta. Captura detenida.");
+      abpDetected = false;
+      tareReady = false;
+      if (captureState == CaptureState::TARING) {
+        captureState = CaptureState::IDLE;
+        startAfterTare = false;
+      } else finishRealCapture("sin respuesta I2C");
+    }
+  }
+}
+
+// Registro BLE 20 B LE: indice:uint16, t_us:uint32, dp:float32,
+// flujo:float32, volumen:float32, tempABP_centiC:int16.
+// 0xFFFF: t_us=numero_registros, dp=T_BME, flujo=P_BME_Pa, volumen=HR_BME,
+//          temp_centi=periodo_objetivo_us.
+// 0xFFFE: t_us=numero_registros, dp=Hz_real, flujo=periodos_perdidos,
+//          volumen=lecturas_fallidas, temp_centi=1 si hubo desbordamiento.
+void csvFrame(uint16_t index, uint8_t out[20]) {
+  memset(out, 0, 20);
+  put16le(out, index);
+  if (index == 0xFFFF) {
+    put32le(out + 2, uint32_t(csvCount));
+    float vals[3] = {ambientTemperatureC, ambientPressurePa, ambientHumidityPct};
+    memcpy(out + 6, vals, 12);
+    put16le(out + 18, uint16_t(SAMPLE_PERIOD_US));
+  } else if (index == 0xFFFE) {
+    put32le(out + 2, uint32_t(csvCount));
+    float vals[3] = {lastMeasuredHz, float(missedPeriods), float(badReads)};
+    memcpy(out + 6, vals, 12);
+    put16le(out + 18, csvOverflow ? 1 : 0);
+  } else if (index < csvCount) {
+    const FlowRecord &r = csvSamples[index];
+    put32le(out + 2, r.tiempoUs);
+    float vals[3] = {r.dpPa, r.flujoLs, r.volumenL};
+    memcpy(out + 6, vals, 12);
+    put16le(out + 18, uint16_t(clamp16(lroundf(r.tempAbpC * 100.0f))));
+  }
+}
+
+void notifyCsvFrame(uint16_t index) {
+  if (!deviceConnected || !csvDataChar) return;
+  uint8_t frame[20];
+  csvFrame(index, frame);
+  csvDataChar->setValue(frame, sizeof(frame));
+  csvDataChar->notify();
+}
+
+void serviceCsvTransfer() {
+  if (!csvTransferActive) return;
+  if (!deviceConnected || captureState != CaptureState::IDLE) {
+    csvTransferActive = false;
+    return;
+  }
+  if ((uint32_t)(millis() - csvLastSendMs) < CSV_SEND_INTERVAL_MS) return;
+  csvLastSendMs = millis();
+  if (csvTransferIndex < csvCount) {
+    notifyCsvFrame(csvTransferIndex++);
+  } else {
+    notifyCsvFrame(0xFFFE); // FIN, reintentar filas ausentes con CSV:ROW:n
+    csvTransferActive = false;
+    Serial.println("# CSV BLE enviado (verificar indices en receptor)");
+  }
+}
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer*) override {
+    deviceConnected = true;
+    disconnectPending = false;
+    Serial.println("BLE conectado");
+  }
+  void onDisconnect(BLEServer*) override {
+    deviceConnected = false;
+    disconnectPending = true;
+    feedback = FeedbackType::IDLE;
+    Serial.println("BLE desconectado");
+  }
+};
+
+class CommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* characteristic) override {
+    if (!bleCommands) return;
+    auto raw = characteristic->getValue();
+    BleCommand message = {};
+    strncpy(message.text, raw.c_str(), sizeof(message.text) - 1);
+    if (xQueueSend(bleCommands, &message, 0) != pdTRUE) {
+      Serial.println("AVISO: cola BLE llena; comando descartado");
+    }
+  }
+};
+
+void processCommand(String command, const char* source) {
+  command.trim();
+  if (command.isEmpty()) return;
+  Serial.printf("RX <- %s: %s\n", source, command.c_str());
+
+  if (command == "STATUS" || command == "?") {
+    printStatus();
+    return;
+  }
+  if (command == "BME:READ" || command == "BMP:READ") {
+    if (captureState != CaptureState::IDLE) Serial.println("# BME ocupado en captura; ver STATUS");
+    else refreshAmbient(true);
+    return;
+  }
+  if (command == "CSV:INFO") {
+    if (captureState == CaptureState::IDLE) notifyCsvFrame(0xFFFF);
+    else Serial.println("# CSV:INFO disponible al terminar la captura");
+    return;
+  }
+  if (command == "CSV:GET") {
+    if (captureState != CaptureState::IDLE || csvCount == 0 || !deviceConnected) {
+      Serial.println("# CSV:GET requiere captura terminada y cliente BLE conectado");
+      return;
+    }
+    csvTransferIndex = 0;
+    csvLastSendMs = millis();
+    notifyCsvFrame(0xFFFF);
+    csvTransferActive = true;
+    Serial.printf("# CSV:GET transfiriendo %u filas de 20 B\n", unsigned(csvCount));
+    return;
+  }
+  if (command.startsWith("CSV:ROW:")) {
+    const String arg = command.substring(8);
+    const int idx = arg.toInt();
+    if (captureState == CaptureState::IDLE && !csvTransferActive && idx >= 0 &&
+        idx < int(csvCount) && arg == String(idx)) notifyCsvFrame(uint16_t(idx));
+    return;
+  }
+  if (command == "CSV:STOP") {
+    csvTransferActive = false;
+    return;
+  }
+  if (command == "CSV:DUMP") {
+    if (captureState == CaptureState::IDLE && csvCount > 0) printCsv();
+    return;
+  }
+  if (command == "TEST:LED" || command == "TEST:BUZZER" || command == "TEST:ALL") {
+    const bool wantsLed = command != "TEST:BUZZER";
+    const bool wantsBuzzer = command != "TEST:LED";
+    if (wantsLed) {
+      if (ENABLE_RGB_LED) {
+        ledTestStartedMs = millis();
+        ledTestActive = true;
+        Serial.println("# TEST:LED iniciado (rojo, verde, azul, amarillo; 600 ms cada uno)");
+      } else {
+        Serial.println("# TEST:LED no iniciado: RGB deshabilitado. Conectar y poner ENABLE_RGB_LED=true");
+      }
+    }
+    if (wantsBuzzer) {
+      if (ENABLE_BUZZER) {
+        buzzerTestStartedMs = millis();
+        buzzerTestActive = true;
+        Serial.println("# TEST:BUZZER iniciado (3 pulsos cortos; buzzer ACTIVO)");
+      } else {
+        Serial.println("# TEST:BUZZER no iniciado: deshabilitado. Conectar y poner ENABLE_BUZZER=true");
+      }
+    }
+    return;
+  }
+  if (command == "TEST:OFF") {
+    ledTestActive = false;
+    buzzerTestActive = false;
+    feedback = FeedbackType::IDLE;
+    feedbackSinceMs = millis();
+    if (ENABLE_RGB_LED) setRgb(false, false, false);
+    if (ENABLE_BUZZER) digitalWrite(BUZZER_PIN, !BUZZER_ON_LEVEL);
+    Serial.println("# TEST:OFF, actuadores apagados y feedback IDLE");
+    return;
+  }
+  if (command == "MODE:DEMO" || command == "MODE:REAL") {
+    if (captureState != CaptureState::IDLE) {
+      Serial.println("# ERROR: primero terminar captura (S o STOP)");
+      return;
+    }
+    runningDemo = false;
+    dataMode = command == "MODE:DEMO" ? DataMode::DEMO : DataMode::REAL;
+    updateModeCharacteristic();
+    Serial.println(dataMode == DataMode::DEMO ?
+      "# MODO DEMO: muestras sinteticas, NO pacientes" :
+      "# MODO REAL: muestras del ABP2, NO sustituye calibracion");
+    return;
+  }
+  if (command == "t" || command == "T" || command == "TARE") {
+    startTare(false);
+    return;
+  }
+  if (command == "m" || command == "M") {
+    if (dataMode != DataMode::REAL) {
+      Serial.println("# Activar MODE:REAL para medir con ABP2.");
+      return;
+    }
+    if (!tareReady) {
+      Serial.println("# Primero t y esperar TARA TERMINADA.");
+      return;
+    }
+    startRealCapture(true);
+    return;
+  }
+  if (command == "S" || command == "s" || command == "STOP") {
+    runningDemo = false;
+    if (captureState == CaptureState::MEASURING) finishRealCapture("detenida por usuario");
+    else if (captureState == CaptureState::TARING) {
+      captureState = CaptureState::IDLE;
+      conversionPending = false;
+      startAfterTare = false;
+      tareReady = false;
+      Serial.println("# Tara cancelada");
+    }
+    return;
+  }
+  if (command.startsWith("START:")) {
+    String option = command.substring(6);
+    if      (option == "NORMAL") scenario = NORMAL;
+    else if (option == "SLOW") scenario = SLOW;
+    else if (option == "COUGH") scenario = COUGH;
+    else if (option == "EARLY") scenario = EARLY;
+    else { Serial.println("# START desconocido"); return; }
+    if (dataMode == DataMode::DEMO) {
+      if (captureState != CaptureState::IDLE) {
+        Serial.println("# ERROR: captura REAL activa"); return;
+      }
+      runningDemo = false;
+      sampleIndex = 0;
+      lastDemoPacketMs = millis();
+      runningDemo = true;
+      Serial.printf("# DEMO iniciada: %s\n", option.c_str());
+    } else {
+      if (captureState != CaptureState::IDLE) {
+        Serial.println("# ERROR: captura en curso"); return;
+      }
+      // Flutter no envia t: se calibra automaticamente si aun no hay tara.
+      Serial.println("# START REAL: nueva lectura BME + tara 1 s (NO soplar)");
+      startTare(true);
+    }
+    return;
+  }
+  // Se conserva compatibilidad de eventos semanticos/color con Flutter.
+  FeedbackType next = FeedbackType::IDLE;
+  bool recognized = true;
+  if (command.startsWith("LED:")) {
+    String color = command.substring(4);
+    if      (color == "GREEN") next = FeedbackType::GOOD_CONTINUE;
+    else if (color == "YELLOW") next = FeedbackType::KEEP_BLOWING;
+    else if (color == "RED") next = FeedbackType::INVALID;
+    else if (color == "BLUE") next = FeedbackType::READY;
+    else if (color == "OFF" || color == "NONE") next = FeedbackType::IDLE;
+    else recognized = false;
+  } else if (command.startsWith("FB:")) {
+    String ev = command.substring(3);
+    if      (ev == "IDLE") next = FeedbackType::IDLE;
+    else if (ev == "READY") next = FeedbackType::READY;
+    else if (ev == "BLOW_HARD") next = FeedbackType::BLOW_HARD;
+    else if (ev == "KEEP_BLOWING") next = FeedbackType::KEEP_BLOWING;
+    else if (ev == "GOOD_CONTINUE") next = FeedbackType::GOOD_CONTINUE;
+    else if (ev == "SLOW_START") next = FeedbackType::SLOW_START;
+    else if (ev == "COUGH") next = FeedbackType::COUGH;
+    else if (ev == "EARLY_STOP") next = FeedbackType::EARLY_STOP;
+    else if (ev == "ACCEPTABLE") next = FeedbackType::ACCEPTABLE;
+    else if (ev == "INVALID") next = FeedbackType::INVALID;
+    else recognized = false;
+  } else recognized = false;
+  if (recognized && feedback != next) {
+    feedback = next;
+    feedbackSinceMs = millis();
+  }
+  if (!recognized) Serial.println("# Comando no reconocido");
+}
+
+char serialBuffer[80] = {0};
+uint8_t serialLen = 0;
+void serviceSerial() {
+  while (Serial.available()) {
+    char c = char(Serial.read());
+    if (c == '\r' || c == '\n') {
+      if (serialLen) {
+        serialBuffer[serialLen] = '\0';
+        processCommand(String(serialBuffer), "SERIAL");
+        serialLen = 0;
+      }
+    } else if (serialLen < sizeof(serialBuffer) - 1) {
+      serialBuffer[serialLen++] = c;
+    } else {
+      serialLen = 0;
+      Serial.println("# ERROR: comando serial demasiado largo");
+    }
+  }
+}
+
+void serviceBleCommands() {
+  if (!bleCommands) return;
+  BleCommand message;
+  // Se evita atascar la adquisicion a 150 Hz si hay muchos eventos FB.
+  uint8_t processed = 0;
+  while (processed < 4 && xQueueReceive(bleCommands, &message, 0) == pdTRUE) {
+    processCommand(String(message.text), "CELULAR");
+    ++processed;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(20);
+  if (ENABLE_RGB_LED) {
+    digitalWrite(LED_R, ANODO_COMUN ? HIGH : LOW);
+    digitalWrite(LED_G, ANODO_COMUN ? HIGH : LOW);
+    digitalWrite(LED_B, ANODO_COMUN ? HIGH : LOW);
+    pinMode(LED_R, OUTPUT);
+    pinMode(LED_G, OUTPUT);
+    pinMode(LED_B, OUTPUT);
+  }
+  if (ENABLE_BUZZER) {
+    digitalWrite(BUZZER_PIN, !BUZZER_ON_LEVEL);
+    pinMode(BUZZER_PIN, OUTPUT);
+  }
+  pinMode(ABP_EOC_PIN, INPUT);
+  feedback = FeedbackType::IDLE;
+  feedbackSinceMs = millis();
+  updateLed();
+  updateBuzzer();
+  delay(500);
+  // Sin autoprueba bloqueante al arrancar: probar bajo demanda con TEST:LED/BUZZER.
+  // hardwareSelfTest(); // opcional, solo tras verificar cableado
+  initSensors();
+
+  bleCommands = xQueueCreate(16, sizeof(BleCommand));
+  if (!bleCommands) Serial.println("# ERROR: sin memoria para cola BLE");
+  BLEDevice::init("EspiroGuia-ESP32");
+  server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+  BLEService* service = server->createService(SERVICE_UUID);
+  samplesChar = service->createCharacteristic(SAMPLES_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY);
+  samplesChar->addDescriptor(new BLE2902());
+  BLECharacteristic* commandChar = service->createCharacteristic(COMMAND_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+  commandChar->setCallbacks(new CommandCallbacks());
+  telemetryChar = service->createCharacteristic(TELEMETRY_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  telemetryChar->addDescriptor(new BLE2902());
+  sensorsChar = service->createCharacteristic(SENSORS_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  sensorsChar->addDescriptor(new BLE2902());
+  modeChar = service->createCharacteristic(MODE_UUID,
+      BLECharacteristic::PROPERTY_READ);
+  csvDataChar = service->createCharacteristic(CSV_DATA_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  csvDataChar->addDescriptor(new BLE2902());
+  uint8_t initialCsvFrame[20] = {0};
+  csvDataChar->setValue(initialCsvFrame, sizeof(initialCsvFrame));
+  updateModeCharacteristic();  // 0=REAL, 1=DEMO
+  uint8_t initialSensorPacket[14] = {0};
+  initialSensorPacket[0] = 1;
+  sensorsChar->setValue(initialSensorPacket, sizeof(initialSensorPacket));
+  service->start();
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+
+  Serial.println("=== EspiroGuia ABP2/BME280 + BLE/CSV | PRUEBA 150 Hz ===");
+  Serial.printf("OBJETIVO: %.2f Hz | PERIODO: %lu us | buffer CSV: %u filas\n",
+                1000000.0 / SAMPLE_PERIOD_US,
+                (unsigned long)SAMPLE_PERIOD_US, (unsigned)MAX_SERIAL_SAMPLES);
+  Serial.printf("I2C SDA=GPIO%u SCL=GPIO%u, ABP2=0x28, EOC=GPIO%u (%s)\n",
+      I2C_SDA_PIN, I2C_SCL_PIN, ABP_EOC_PIN,
+      USE_ABP_EOC ? "habilitado" : "deshabilitado");
+  Serial.printf("RGB externo=%s | buzzer externo=%s\n",
+      ENABLE_RGB_LED ? "habilitado" : "deshabilitado",
+      ENABLE_BUZZER ? "habilitado" : "deshabilitado");
+  Serial.println("MODO REAL por defecto; NO se inventa flujo si faltan sensores.");
+  Serial.println("SERIAL: t / m / S / STATUS / CSV:DUMP / BME:READ");
+  Serial.println("BLE: START:NORMAL / STOP / CSV:GET / CSV:ROW:n / CSV:INFO");
+  Serial.println("PRUEBAS: TEST:LED / TEST:BUZZER / TEST:ALL / TEST:OFF");
+  Serial.println("BLE: START:NORMAL y STOP; FB:... mantiene LED+buzzer.");
+  Serial.println("ATENCION: ventilacion / calibracion experimental, no uso clinico.");
+  // No medir BME280 ni hacer tara durante el arranque: se realiza
+  // una vez antes de cada maniobra (START por BLE o t por Serial).
+}
+
+void loop() {
+  serviceSerial();
+  serviceBleCommands();
+  if (disconnectPending) {
+    csvTransferActive = false;
+    disconnectPending = false;
+    runningDemo = false;
+    if (captureState == CaptureState::MEASURING && !csvRequested)
+      finishRealCapture("BLE desconectado");
+    if (captureState == CaptureState::TARING && startAfterTare) {
+      captureState = CaptureState::IDLE;
+      conversionPending = false;
+      startAfterTare = false;
+    }
+  }
+  static bool hadClient = false;
+  if (!deviceConnected && hadClient) {
+    server->startAdvertising();
+    hadClient = false;
+  }
+  if (deviceConnected) hadClient = true;
+
+  serviceCapture(); // 150 Hz objetivo; comprobar Hz reales en el CSV
+  serviceCsvTransfer(); // transmision BLE en reposo, no durante la adquisicion
+  const uint32_t now = millis();
+  if (runningDemo && deviceConnected &&
+      (uint32_t)(now - lastDemoPacketMs) >= 100) {
+    lastDemoPacketMs = now;
+    sendSyntheticSamples();
+  }
+  if (deviceConnected && (uint32_t)(now - lastTelemetryMs) >= 1000) {
+    lastTelemetryMs = now;
+    sendTelemetry();
+  }
+  if (captureState == CaptureState::IDLE && abpDetected &&
+      (uint32_t)(now - lastIdleAbpMs) >= 100) {
+    lastIdleAbpMs = now;
+    refreshIdleAbp();
+  }
+  if (captureState == CaptureState::IDLE && !abpDetected &&
+      (uint32_t)(now - lastAbpProbeMs) >= 3000) probeAbp();
+  const uint32_t sensorInterval =
+      captureState == CaptureState::MEASURING ? SENSOR_BLE_LIVE_INTERVAL_MS
+                                              : SENSOR_BLE_INTERVAL_MS;
+  if (deviceConnected &&
+      (uint32_t)(now - lastSensorBleMs) >= sensorInterval) {
+    lastSensorBleMs = now;
+    publishSensorReadings();
+  }
+  updateLed();
+  updateBuzzer();
+  // Temporizacion adaptable: en captura se reduce la latencia de sondeo.
+  // Sigue cediendo el procesador durante la mayor parte de la conversion.
+  if (captureState == CaptureState::IDLE) {
+    delay(1);
+  } else if (conversionPending) {
+    const uint32_t ageUs = (uint32_t)(micros() - abpCommandSentUs);
+    if (ageUs < 3200UL) delay(1);
+    else delayMicroseconds(120);
+  } else {
+    const int32_t untilNextUs = (int32_t)(nextSampleUs - micros());
+    if (untilNextUs > 1800) delay(1);
+    else delayMicroseconds(120);
+  }
+}
